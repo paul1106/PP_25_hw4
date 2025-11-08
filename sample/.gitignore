@@ -1,0 +1,15 @@
+# NCU Profiling 報告檔案（太大，不應提交）
+ncu_reports/*.ncu-rep
+
+# 測試輸出檔案（可由程式生成）
+outputs/*.out
+
+# 編譯產物
+*.o
+hw4
+hw4_cpu
+
+# Temporary files
+*.swp
+*.swo
+*~

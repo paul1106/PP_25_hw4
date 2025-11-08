@@ -1,0 +1,17 @@
+{
+    "configurations": [
+        {
+            "name": "Linux",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "/work/HPC_SYS/twnia2/pkg-rocky8/nvidia/cuda/cuda-12.8/include"
+            ],
+            "defines": [],
+            "compilerPath": "/work/HPC_SYS/twnia2/pkg-rocky8/nvidia/cuda/cuda-12.8/bin/nvcc",
+            "cStandard": "c17",
+            "cppStandard": "gnu++17",
+            "intelliSenseMode": "linux-gcc-x64"
+        }
+    ],
+    "version": 4
+}
