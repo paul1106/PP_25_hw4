@@ -160,6 +160,14 @@ void sha256(SHA256 *ctx, const BYTE *msg, size_t len)
 // Constant memory for block header (80 bytes)
 __constant__ BYTE dev_block_header[80];
 
+// Constant memory for SHA-256 midstate (8 WORDs = 32 bytes)
+// This stores the intermediate hash state after processing the first 64 bytes
+__constant__ WORD dev_midstate[8];
+
+// Constant memory for the remaining 16 bytes of block header (chunk 1)
+// Contains: remaining merkle_root (12 bytes) + ntime (4 bytes) + nbits (4 bytes) + nonce (4 bytes)
+__constant__ BYTE dev_block_chunk1[16];
+
 // GPU constant memory k array for SHA-256
 __constant__ WORD dev_k[64] = {
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
@@ -170,6 +178,55 @@ __constant__ WORD dev_k[64] = {
     0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
     0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
     0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2};
+
+// ============== MIDSTATE PRECOMPUTATION ==============
+
+/**
+ * Compute SHA-256 midstate from the first 64 bytes of the block header.
+ *
+ * Bitcoin block header structure (80 bytes):
+ * - Chunk 0 (bytes 0-63):  version(4) + prevhash(32) + merkle_root[0:28](28)
+ * - Chunk 1 (bytes 64-79): merkle_root[28:32](4) + ntime(4) + nbits(4) + nonce(4)
+ *
+ * The first chunk is constant for all nonce values, so we can precompute
+ * the SHA-256 state after processing it once on the CPU, then reuse this
+ * "midstate" on the GPU for all threads.
+ *
+ * @param midstate Output: 8 WORD values representing the intermediate hash state
+ * @param block_header Input: 80-byte block header
+ */
+void compute_midstate(WORD *midstate, const BYTE *block_header)
+{
+    // Initialize SHA-256 state with standard IV
+    SHA256 ctx;
+    ctx.h[0] = 0x6a09e667;
+    ctx.h[1] = 0xbb67ae85;
+    ctx.h[2] = 0x3c6ef372;
+    ctx.h[3] = 0xa54ff53a;
+    ctx.h[4] = 0x510e527f;
+    ctx.h[5] = 0x9b05688c;
+    ctx.h[6] = 0x1f83d9ab;
+    ctx.h[7] = 0x5be0cd19;
+
+    // Process first 64 bytes (chunk 0)
+    sha256_transform(&ctx, block_header);
+
+    // Copy the intermediate state (midstate)
+    for (int i = 0; i < 8; ++i)
+    {
+        midstate[i] = ctx.h[i];
+    }
+
+    printf("Midstate precomputation complete:\n");
+    printf("  Midstate[0-7]: ");
+    for (int i = 0; i < 8; ++i)
+    {
+        printf("%08x ", midstate[i]);
+    }
+    printf("\n");
+}
+
+// ============== END MIDSTATE PRECOMPUTATION ==============
 
 // ============== GPU DEVICE FUNCTIONS ==============
 
@@ -312,6 +369,94 @@ __device__ void double_sha256_device(SHA256 *sha256_ctx, unsigned char *bytes, s
 {
     SHA256 tmp;
     sha256_device(&tmp, (BYTE *)bytes, len);
+    sha256_device(sha256_ctx, (BYTE *)&tmp, sizeof(tmp));
+}
+
+/**
+ * SHA-256 hash using precomputed midstate.
+ *
+ * This optimized version starts from the midstate (intermediate hash state
+ * after processing the first 64 bytes), then processes only the remaining
+ * 16 bytes + padding. This saves approximately 50% of SHA-256 computation
+ * for the first hash in double SHA-256.
+ *
+ * @param ctx Output SHA-256 context
+ * @param chunk1 The remaining 16 bytes (merkle_root[28:32] + ntime + nbits + nonce)
+ */
+__device__ void sha256_from_midstate_device(SHA256 *ctx, const BYTE *chunk1)
+{
+    // Load precomputed midstate from constant memory
+    // This is the SHA-256 state after processing the first 64 bytes
+    ctx->h[0] = dev_midstate[0];
+    ctx->h[1] = dev_midstate[1];
+    ctx->h[2] = dev_midstate[2];
+    ctx->h[3] = dev_midstate[3];
+    ctx->h[4] = dev_midstate[4];
+    ctx->h[5] = dev_midstate[5];
+    ctx->h[6] = dev_midstate[6];
+    ctx->h[7] = dev_midstate[7];
+
+    // Prepare the second chunk (16 bytes data + padding)
+    BYTE m[64] = {};
+
+// Copy the 16 bytes of chunk1
+#pragma unroll
+    for (int i = 0; i < 16; ++i)
+    {
+        m[i] = chunk1[i];
+    }
+
+    // Append a single '1' bit (0x80 = 10000000 in binary)
+    m[16] = 0x80;
+
+    // The remaining bytes are already 0 from initialization
+    // Append length in bits as 64-bit big-endian integer
+    // Total length = 80 bytes = 640 bits
+    // In big-endian: 640 = 0x0280
+    unsigned long long L = 80 * 8; // 640 bits
+    m[63] = L;
+    m[62] = L >> 8;
+    m[61] = L >> 16;
+    m[60] = L >> 24;
+    m[59] = L >> 32;
+    m[58] = L >> 40;
+    m[57] = L >> 48;
+    m[56] = L >> 56;
+
+    // Process the second chunk
+    sha256_transform_device(ctx, m);
+
+// Convert to big-endian for output
+#pragma unroll
+    for (int i = 0; i < 32; i += 4)
+    {
+        BYTE temp;
+        temp = ctx->b[i];
+        ctx->b[i] = ctx->b[i + 3];
+        ctx->b[i + 3] = temp;
+        temp = ctx->b[i + 1];
+        ctx->b[i + 1] = ctx->b[i + 2];
+        ctx->b[i + 2] = temp;
+    }
+}
+
+/**
+ * Double SHA-256 using midstate optimization for the first hash.
+ *
+ * First hash:  Uses midstate + processes only 16 bytes
+ * Second hash: Standard full SHA-256 on the 32-byte result
+ *
+ * @param sha256_ctx Output context containing the final hash
+ * @param chunk1 The last 16 bytes of the 80-byte block header
+ */
+__device__ void double_sha256_midstate_device(SHA256 *sha256_ctx, const BYTE *chunk1)
+{
+    SHA256 tmp;
+
+    // First SHA-256: Use midstate optimization
+    sha256_from_midstate_device(&tmp, chunk1);
+
+    // Second SHA-256: Standard full hash of the 32-byte result
     sha256_device(sha256_ctx, (BYTE *)&tmp, sizeof(tmp));
 }
 
@@ -480,25 +625,35 @@ __global__ void gpu_mine(
     if (*found)
         return;
 
-    // Prepare block header with current nonce
-    BYTE block[80];
+    // ============== MIDSTATE OPTIMIZATION ==============
+    // Instead of processing all 80 bytes, we only need to process the last 16 bytes
+    // because the first 64 bytes are constant and their intermediate state (midstate)
+    // has been precomputed on the CPU and stored in constant memory.
 
-// Copy from constant memory
+    // Prepare chunk1: last 16 bytes of block header
+    // Bytes 64-79: merkle_root[28:32](4) + ntime(4) + nbits(4) + nonce(4)
+    BYTE chunk1[16];
+
+// Copy bytes 64-75 from constant memory (merkle_root[28:32] + ntime + nbits)
 #pragma unroll
-    for (int i = 0; i < 76; ++i)
+    for (int i = 0; i < 12; ++i)
     {
-        block[i] = dev_block_header[i];
+        chunk1[i] = dev_block_chunk1[i];
     }
 
-    // Add nonce (little-endian)
-    block[76] = nonce & 0xff;
-    block[77] = (nonce >> 8) & 0xff;
-    block[78] = (nonce >> 16) & 0xff;
-    block[79] = (nonce >> 24) & 0xff;
+    // Add nonce (little-endian) at bytes 12-15 of chunk1
+    chunk1[12] = nonce & 0xff;
+    chunk1[13] = (nonce >> 8) & 0xff;
+    chunk1[14] = (nonce >> 16) & 0xff;
+    chunk1[15] = (nonce >> 24) & 0xff;
 
-    // Perform double SHA-256
+    // Perform double SHA-256 using midstate optimization
+    // First hash: Uses precomputed midstate + processes only chunk1 (16 bytes)
+    // Second hash: Standard SHA-256 on the 32-byte result
     SHA256 hash_result;
-    double_sha256_device(&hash_result, block, 80);
+    double_sha256_midstate_device(&hash_result, chunk1);
+
+    // ============== END MIDSTATE OPTIMIZATION ==============
 
     // Compare with target (little-endian comparison)
     bool valid = true;
@@ -609,15 +764,39 @@ void solve(FILE *fin, FILE *fout)
     print_hex_inverse(target_hex, 32);
     printf("\n");
 
-    // ********** GPU Mining **************
+    // ********** GPU Mining with Midstate Optimization **************
 
-    // Prepare block header (80 bytes) for constant memory
+    printf("\n=== Midstate Precomputation ===\n");
+
+    // Prepare complete block header (80 bytes)
     BYTE host_block_header[80];
     memcpy(host_block_header, &block, 76); // version, prevhash, merkle_root, ntime, nbits
-    // nonce will be filled by each thread
+    // nonce will be filled by each thread (bytes 76-79)
 
-    // Copy block header to constant memory
+    // Compute midstate from first 64 bytes
+    WORD host_midstate[8];
+    compute_midstate(host_midstate, host_block_header);
+
+    // Prepare chunk1: bytes 64-79 (last 16 bytes)
+    // Contains: merkle_root[28:32](4) + ntime(4) + nbits(4) + nonce(4)
+    BYTE host_chunk1[16];
+    memcpy(host_chunk1, host_block_header + 64, 12); // Copy bytes 64-75
+    // Bytes 12-15 (nonce) will be filled by each GPU thread
+
+    printf("Chunk1 (first 12 bytes): ");
+    print_hex(host_chunk1, 12);
+    printf(" + nonce(4 bytes)\n");
+
+    // Copy midstate to device constant memory
+    cudaMemcpyToSymbol(dev_midstate, host_midstate, 8 * sizeof(WORD));
+
+    // Copy chunk1 (without nonce) to device constant memory
+    cudaMemcpyToSymbol(dev_block_chunk1, host_chunk1, 12);
+
+    // Keep old dev_block_header copy for backward compatibility (optional)
     cudaMemcpyToSymbol(dev_block_header, host_block_header, 76);
+
+    printf("=== Midstate transferred to GPU ===\n\n");
 
     // Allocate device memory for target, found flag, and result
     unsigned char *dev_target;
@@ -642,7 +821,8 @@ void solve(FILE *fin, FILE *fout)
     unsigned int result_nonce = 0;
     bool found = false;
 
-    printf("Starting GPU mining...\n");
+    printf("Starting GPU mining with midstate optimization...\n");
+    printf("Each thread processes only 16 bytes instead of 80 bytes!\n\n");
 
     // Launch kernels in batches until solution is found
     while (start_nonce <= 0xffffffff && !found)
